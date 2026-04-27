@@ -6,30 +6,36 @@
  * 1. Compares spot prices across all pool pairs (O(n²) but n is small).
  * 2. Identifies price discrepancies where buying in one pool and
  *    selling in another yields a positive spread.
- * 3. Deducts swap fees from BOTH the buy and sell pools.
- * 4. Deducts estimated Solana transaction costs (2 txs: buy + sell).
+ * 3. Simulates the actual constant-product swap on each leg
+ *    (Δy = (Δx · (1 − f) · y) / (x + Δx · (1 − f))), so the result
+ *    accounts for slippage / pool depth — not just the spot spread.
+ * 4. Deducts estimated Solana transaction costs (2 transactions:
+ *    buy leg + sell leg).
  * 5. Ranks opportunities by net profit descending.
  *
- * ─── PROFIT MATH ───
+ * ─── PROFIT MATH (CPMM constant-product) ───
  *
- * Given:
- *   - tradeSize   = notional trade amount in quote token (e.g. USDC)
- *   - priceBuy    = spot price in the "cheap" pool (lower price)
- *   - priceSell   = spot price in the "expensive" pool (higher price)
- *   - feeRateBuy  = swap fee of the buy pool (e.g. 0.0025)
- *   - feeRateSell = swap fee of the sell pool (e.g. 0.0025)
- *   - txCostUsd   = estimated Solana tx fee in USD (for 2 transactions)
+ * For a pool with reserves (xBase, yQuote) and fee rate f, swapping
+ * `dQuoteIn` quote tokens for base tokens yields:
  *
- * Step 1: Amount of base token received from Buy pool (after fee)
- *   tokensReceived = (tradeSize / priceBuy) * (1 - feeRateBuy)
+ *   dQuoteAfterFee = dQuoteIn * (1 − f)
+ *   dBaseOut       = (dQuoteAfterFee * xBase) / (yQuote + dQuoteAfterFee)
  *
- * Step 2: Proceeds from selling those tokens in Sell pool (after fee)
- *   sellProceeds = tokensReceived * priceSell * (1 - feeRateSell)
+ * For the symmetric direction (selling `dBaseIn` base tokens for quote):
  *
- * Step 3: Net profit
- *   netProfit = sellProceeds - tradeSize - txCostUsd
+ *   dBaseAfterFee  = dBaseIn * (1 − f)
+ *   dQuoteOut      = (dBaseAfterFee * yQuote) / (xBase + dBaseAfterFee)
  *
- * An opportunity is "actionable" when netProfit > minProfitThreshold.
+ * Round-trip arbitrage:
+ *   1) Spend `tradeSizeQuote` USD-equivalent quote in the buy pool → baseOut
+ *   2) Sell baseOut in the sell pool → quoteOut
+ *   3) netProfit = quoteOut − tradeSizeQuote − txCost
+ *
+ * IMPORTANT: This properly accounts for slippage. Earlier the code used
+ * a "spot price * trade size" approximation, which produced absurd net
+ * profits on dust pools (e.g. $33 463 on a $1 000 trade against a $20-TVL
+ * pool). With the AMM formula such pools naturally show negative net
+ * profit because the swap consumes the entire pool.
  */
 
 import { CpmmPool } from "./raydium";
@@ -48,20 +54,29 @@ export interface ArbitrageOpportunity {
   /** Pool where we sell the base token (higher spot price) */
   sellPool: CpmmPool;
 
-  /** Spot price in the buy pool */
+  /** Spot price in the buy pool (informational) */
   buyPrice: number;
 
-  /** Spot price in the sell pool */
+  /** Spot price in the sell pool (informational) */
   sellPrice: number;
 
   /** Raw price spread as a percentage: ((sellPrice - buyPrice) / buyPrice) * 100 */
   spreadPct: number;
 
-  /** Gross profit before fees (USD) */
-  grossProfitUsd: number;
+  /** Effective price actually paid for base on the buy leg (after slippage) */
+  effectiveBuyPrice: number;
 
-  /** Total fees deducted: buy fee + sell fee + tx costs (USD) */
-  totalFeesUsd: number;
+  /** Effective price actually received for base on the sell leg (after slippage) */
+  effectiveSellPrice: number;
+
+  /** Base tokens received from the buy leg (after fee + slippage) */
+  baseAmountOut: number;
+
+  /** Quote tokens received from the sell leg (after fee + slippage) */
+  quoteAmountOut: number;
+
+  /** Gross profit (USD) before tx costs but after pool fees + slippage */
+  grossProfitUsd: number;
 
   /** Buy pool swap fee component (USD) */
   buyFeeUsd: number;
@@ -72,7 +87,10 @@ export interface ArbitrageOpportunity {
   /** Solana transaction cost component (USD) */
   txCostUsd: number;
 
-  /** Net profit after all fees (USD) */
+  /** Total fees deducted: buy fee + sell fee + tx costs (USD) */
+  totalFeesUsd: number;
+
+  /** Net profit after pool fees, slippage AND tx costs (USD) */
   netProfitUsd: number;
 
   /** Net profit as a percentage of trade size */
@@ -83,6 +101,34 @@ export interface ArbitrageOpportunity {
 
   /** Timestamp when this opportunity was detected */
   detectedAt: Date;
+}
+
+// ── Pure math helpers ────────────────────────────────────────────────
+
+/**
+ * Constant-product swap output, with a fee charged on the input side.
+ *
+ *   amountInAfterFee = amountIn * (1 − feeRate)
+ *   amountOut        = (amountInAfterFee * reserveOut) /
+ *                      (reserveIn + amountInAfterFee)
+ *
+ * @param amountIn   Input amount (in input-token human units)
+ * @param reserveIn  Pool reserve of the input token (human units)
+ * @param reserveOut Pool reserve of the output token (human units)
+ * @param feeRate    Fee rate as a decimal (e.g. 0.0025 for 25 bps)
+ * @returns Output amount (human units), or 0 for invalid inputs
+ */
+export function getCpmmAmountOut(
+  amountIn: number,
+  reserveIn: number,
+  reserveOut: number,
+  feeRate: number
+): number {
+  if (amountIn <= 0 || reserveIn <= 0 || reserveOut <= 0) return 0;
+  if (feeRate < 0 || feeRate >= 1) return 0;
+
+  const amountInAfterFee = amountIn * (1 - feeRate);
+  return (amountInAfterFee * reserveOut) / (reserveIn + amountInAfterFee);
 }
 
 // ── Core Functions ───────────────────────────────────────────────────
@@ -107,8 +153,7 @@ export function detectArbitrage(pools: CpmmPool[]): ArbitrageOpportunity[] {
   const opportunities: ArbitrageOpportunity[] = [];
   const tradeSizeUsd = config.tradeSizeUsd;
 
-  // Estimated tx cost in USD for the full arb round-trip (2 swaps)
-  // Each swap is a separate transaction on Solana
+  // Tx cost in USD for the full arbitrage round-trip (2 transactions)
   const txCostUsd = config.solTxFeeEstimate * 2 * config.solPriceUsd;
 
   // Compare all pool pairs
@@ -120,17 +165,9 @@ export function detectArbitrage(pools: CpmmPool[]): ArbitrageOpportunity[] {
       // Skip pools with invalid prices
       if (poolA.spotPrice <= 0 || poolB.spotPrice <= 0) continue;
 
-      // Determine which pool is cheaper (buy) and which is more expensive (sell)
-      let buyPool: CpmmPool;
-      let sellPool: CpmmPool;
-
-      if (poolA.spotPrice < poolB.spotPrice) {
-        buyPool = poolA;
-        sellPool = poolB;
-      } else {
-        buyPool = poolB;
-        sellPool = poolA;
-      }
+      // Determine which pool is cheaper (buy) and more expensive (sell)
+      const [buyPool, sellPool] =
+        poolA.spotPrice < poolB.spotPrice ? [poolA, poolB] : [poolB, poolA];
 
       const opp = calculateOpportunity(
         buyPool,
@@ -159,7 +196,7 @@ export function detectArbitrage(pools: CpmmPool[]): ArbitrageOpportunity[] {
         actionable: actionable.length,
         bestProfit: `$${actionable[0].netProfitUsd.toFixed(4)}`,
       },
-      `🚨 ${actionable.length} actionable arbitrage opportunit${actionable.length === 1 ? "y" : "ies"} detected!`
+      `${actionable.length} actionable arbitrage opportunit${actionable.length === 1 ? "y" : "ies"} detected`
     );
   } else if (opportunities.length > 0) {
     logger.debug(
@@ -167,7 +204,7 @@ export function detectArbitrage(pools: CpmmPool[]): ArbitrageOpportunity[] {
         total: opportunities.length,
         bestSpread: `${opportunities[0].spreadPct.toFixed(4)}%`,
       },
-      "Spread detected but below profit threshold after fees"
+      "Spread detected but below profit threshold after fees + slippage"
     );
   }
 
@@ -175,13 +212,19 @@ export function detectArbitrage(pools: CpmmPool[]): ArbitrageOpportunity[] {
 }
 
 /**
- * Calculate the full profit/loss breakdown for a single arbitrage opportunity.
+ * Calculate the full profit/loss breakdown for a single arbitrage opportunity,
+ * simulating both legs against the actual CPMM curve (so slippage is
+ * correctly priced in).
  *
- * @param buyPool     - The pool with the lower spot price (we buy here)
- * @param sellPool    - The pool with the higher spot price (we sell here)
- * @param tradeSizeUsd - Notional trade size in USD
- * @param txCostUsd   - Estimated round-trip Solana tx cost in USD
- * @returns Fully computed ArbitrageOpportunity
+ * Reserve orientation: in our `CpmmPool`, `reserveA` is base and `reserveB`
+ * is quote. `spotPrice` = reserveB / reserveA (i.e. price of 1 base in quote).
+ * Trade size is denominated in quote; we convert to USD via tradeSizeUsd
+ * (the user supplies trade size already in USD).
+ *
+ * @param buyPool      Pool with the lower spot price (we buy base here)
+ * @param sellPool     Pool with the higher spot price (we sell base here)
+ * @param tradeSizeUsd Notional trade size in USD (= quote amount in)
+ * @param txCostUsd    Estimated round-trip Solana tx cost in USD
  */
 function calculateOpportunity(
   buyPool: CpmmPool,
@@ -192,25 +235,43 @@ function calculateOpportunity(
   const buyPrice = buyPool.spotPrice;
   const sellPrice = sellPool.spotPrice;
 
-  // ── Step 1: Calculate raw spread ──
+  // ── Spot spread (informational only — actual profit uses AMM math) ──
   const spreadPct = ((sellPrice - buyPrice) / buyPrice) * 100;
 
-  // ── Step 2: Simulate the buy leg ──
-  // We spend `tradeSizeUsd` worth of quote tokens to buy base tokens.
-  // The buy pool charges its fee on the input.
-  const tokensReceived = (tradeSizeUsd / buyPrice) * (1 - buyPool.feeRate);
+  // ── Buy leg: spend `tradeSizeUsd` of quote (B) to get base (A) ──
+  // Inputs: reserveIn = buyPool.reserveB (quote), reserveOut = buyPool.reserveA (base)
+  const baseAmountOut = getCpmmAmountOut(
+    tradeSizeUsd,
+    buyPool.reserveB,
+    buyPool.reserveA,
+    buyPool.feeRate
+  );
 
-  // ── Step 3: Simulate the sell leg ──
-  // We sell the received base tokens in the sell pool.
-  // The sell pool charges its fee on the output.
-  const sellProceeds = tokensReceived * sellPrice * (1 - sellPool.feeRate);
+  // ── Sell leg: sell base (A) into sellPool to get quote (B) ──
+  // Inputs: reserveIn = sellPool.reserveA (base), reserveOut = sellPool.reserveB (quote)
+  const quoteAmountOut = getCpmmAmountOut(
+    baseAmountOut,
+    sellPool.reserveA,
+    sellPool.reserveB,
+    sellPool.feeRate
+  );
 
-  // ── Step 4: Calculate profit components ──
-  const grossProfitUsd = sellProceeds - tradeSizeUsd;
+  // ── Effective prices (post-slippage) ──
+  // Effective buy price: USD-quote spent per base received
+  const effectiveBuyPrice =
+    baseAmountOut > 0 ? tradeSizeUsd / baseAmountOut : Number.POSITIVE_INFINITY;
+  // Effective sell price: USD-quote received per base sold
+  const effectiveSellPrice =
+    baseAmountOut > 0 ? quoteAmountOut / baseAmountOut : 0;
 
-  // Fee breakdown for transparency
-  const buyFeeUsd = (tradeSizeUsd / buyPrice) * buyPool.feeRate * buyPrice;
-  const sellFeeUsd = tokensReceived * sellPrice * sellPool.feeRate;
+  // ── Profit components ──
+  const grossProfitUsd = quoteAmountOut - tradeSizeUsd;
+
+  // Fee breakdown (informational): the protocol fee deducted on each leg.
+  // Buy leg fee in USD = quote-in * feeRate (charged on quote input).
+  const buyFeeUsd = tradeSizeUsd * buyPool.feeRate;
+  // Sell leg fee in USD = effective USD value of the base-input fee.
+  const sellFeeUsd = baseAmountOut * effectiveSellPrice * sellPool.feeRate;
 
   const totalFeesUsd = buyFeeUsd + sellFeeUsd + txCostUsd;
   const netProfitUsd = grossProfitUsd - txCostUsd;
@@ -224,11 +285,15 @@ function calculateOpportunity(
     buyPrice,
     sellPrice,
     spreadPct,
+    effectiveBuyPrice,
+    effectiveSellPrice,
+    baseAmountOut,
+    quoteAmountOut,
     grossProfitUsd,
-    totalFeesUsd,
     buyFeeUsd,
     sellFeeUsd,
     txCostUsd,
+    totalFeesUsd,
     netProfitUsd,
     netProfitPct,
     isActionable,
@@ -247,12 +312,14 @@ export function formatOpportunitySummary(opp: ArbitrageOpportunity): string {
 
   return [
     `[${pair}] Arbitrage Opportunity`,
-    `  Buy  @ ${buyId}... : ${opp.buyPrice.toFixed(8)} (fee: ${(opp.buyPool.feeRate * 100).toFixed(2)}%)`,
-    `  Sell @ ${sellId}... : ${opp.sellPrice.toFixed(8)} (fee: ${(opp.sellPool.feeRate * 100).toFixed(2)}%)`,
-    `  Spread: ${opp.spreadPct.toFixed(4)}%`,
-    `  Gross:  $${opp.grossProfitUsd.toFixed(4)}`,
-    `  Fees:   $${opp.totalFeesUsd.toFixed(4)} (buy: $${opp.buyFeeUsd.toFixed(4)}, sell: $${opp.sellFeeUsd.toFixed(4)}, tx: $${opp.txCostUsd.toFixed(4)})`,
-    `  Net:    $${opp.netProfitUsd.toFixed(4)} (${opp.netProfitPct.toFixed(4)}%)`,
-    `  Status: ${opp.isActionable ? "✅ ACTIONABLE" : "❌ Below threshold"}`,
+    `  Buy  @ ${buyId}... : spot=${opp.buyPrice.toFixed(8)}  effective=${opp.effectiveBuyPrice.toFixed(8)} (fee: ${(opp.buyPool.feeRate * 100).toFixed(2)}%)`,
+    `  Sell @ ${sellId}... : spot=${opp.sellPrice.toFixed(8)}  effective=${opp.effectiveSellPrice.toFixed(8)} (fee: ${(opp.sellPool.feeRate * 100).toFixed(2)}%)`,
+    `  Spread (spot): ${opp.spreadPct.toFixed(4)}%`,
+    `  Base out:      ${opp.baseAmountOut.toFixed(6)} ${opp.buyPool.symbolA}`,
+    `  Quote out:     ${opp.quoteAmountOut.toFixed(4)} ${opp.buyPool.symbolB}`,
+    `  Gross:         $${opp.grossProfitUsd.toFixed(4)}`,
+    `  Fees:          $${opp.totalFeesUsd.toFixed(4)} (buy: $${opp.buyFeeUsd.toFixed(4)}, sell: $${opp.sellFeeUsd.toFixed(4)}, tx: $${opp.txCostUsd.toFixed(4)})`,
+    `  Net:           $${opp.netProfitUsd.toFixed(4)} (${opp.netProfitPct.toFixed(4)}%)`,
+    `  Status:        ${opp.isActionable ? "ACTIONABLE" : "Below threshold"}`,
   ].join("\n");
 }
