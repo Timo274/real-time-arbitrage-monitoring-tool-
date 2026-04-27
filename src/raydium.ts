@@ -27,6 +27,7 @@
 
 import axios, { AxiosError } from "axios";
 import { logger } from "./logger";
+import { config } from "./config";
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -261,38 +262,38 @@ export async function discoverPools(
         .map((raw) => parsePool(raw))
         .filter((pool): pool is CpmmPool => pool !== null);
 
-      // Filter to CPMM pools only (identified by program ID)
-      let pools = allParsed.filter(
-        (pool) => pool.programId === CPMM_PROGRAM_ID
+      // Filter to CPMM pools (and optionally AMM v4) by program ID.
+      // We deliberately NEVER include CLMM pools: their spot price is
+      // governed by tick math, not x*y=k, so naive comparison would be
+      // incorrect.
+      const allowedProgramIds: Set<string> = new Set([CPMM_PROGRAM_ID]);
+      if (config.includeAmmV4) {
+        allowedProgramIds.add(AMM_V4_PROGRAM_ID);
+      }
+
+      const pools = allParsed.filter((pool) =>
+        allowedProgramIds.has(pool.programId)
       );
 
-      if (pools.length > 0) {
-        logger.info(
-          { cpmmCount: pools.length, totalParsed: allParsed.length },
-          `Found ${pools.length} CPMM pool(s) (filtered by program ID)`
-        );
-      } else {
-        // Fallback: if no CPMM pools, include ALL standard-type pools
-        // (AMM v4 + CPMM) for cross-pool-type arbitrage detection
-        pools = allParsed.filter(
-          (pool) =>
-            pool.programId === CPMM_PROGRAM_ID ||
-            pool.programId === AMM_V4_PROGRAM_ID
-        );
-        if (pools.length > 0) {
-          logger.info(
-            { count: pools.length },
-            `No CPMM-only pools found; including ${pools.length} Standard pool(s) (AMM v4 + CPMM)`
-          );
-        } else {
-          // Last resort: include everything (CLMM, AMM, CPMM)
-          pools = allParsed;
-          logger.info(
-            { count: pools.length },
-            `No Standard pools found; including all ${pools.length} pool(s) for comparison`
-          );
-        }
-      }
+      const cpmmCount = pools.filter(
+        (p) => p.programId === CPMM_PROGRAM_ID
+      ).length;
+      const ammV4Count = pools.filter(
+        (p) => p.programId === AMM_V4_PROGRAM_ID
+      ).length;
+
+      logger.info(
+        {
+          totalParsed: allParsed.length,
+          cpmmCount,
+          ammV4Count,
+          includeAmmV4: config.includeAmmV4,
+        },
+        `Filtered to ${pools.length} eligible pool(s) ` +
+          `(CPMM=${cpmmCount}` +
+          (config.includeAmmV4 ? `, AMM v4=${ammV4Count}` : "") +
+          ")"
+      );
 
       // Sort by TVL descending — higher TVL pools are more reliable
       pools.sort((a, b) => b.tvl - a.tvl);
@@ -389,11 +390,14 @@ function parsePool(raw: RaydiumApiPool): CpmmPool | null {
       return null;
     }
 
-    // Use the API's pre-calculated price if available; otherwise compute from reserves.
-    // The API `price` field is the most accurate as it accounts for CLMM tick math.
-    const apiPrice = Number(raw.price);
+    // For x*y=k pools (CPMM / AMM v4) compute spot price directly from
+    // reserves so it stays consistent with the AMM swap math used in the
+    // arbitrage module. We still log a warning if the API's pre-computed
+    // price disagrees significantly (e.g. for accidentally-included CLMM
+    // pools, where tick math diverges from reserve ratio).
     const reservePrice = calculateSpotPrice(reserveA, reserveB);
-    const spotPrice = apiPrice > 0 ? apiPrice : reservePrice;
+    const apiPrice = Number(raw.price);
+    const spotPrice = reservePrice > 0 ? reservePrice : apiPrice;
 
     if (apiPrice > 0 && reservePrice > 0) {
       const priceDiffPct = Math.abs((apiPrice - reservePrice) / apiPrice) * 100;
@@ -405,7 +409,7 @@ function parsePool(raw: RaydiumApiPool): CpmmPool | null {
             reservePrice: reservePrice.toFixed(6),
             diffPct: priceDiffPct.toFixed(2),
           },
-          "API price and reserve-derived price differ significantly (CLMM pool?)"
+          "API price differs from reserve-derived price (likely CLMM pool)"
         );
       }
     }

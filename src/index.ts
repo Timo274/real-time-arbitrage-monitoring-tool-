@@ -20,10 +20,12 @@
  */
 
 import Table from "cli-table3";
+import { Connection } from "@solana/web3.js";
 import { config } from "./config";
 import { logger } from "./logger";
 import { discoverPools, CpmmPool } from "./raydium";
 import { detectArbitrage, ArbitrageOpportunity, formatOpportunitySummary } from "./arbitrage";
+import { refreshReservesOnchain } from "./onchain";
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -52,6 +54,15 @@ let isRunning = true;
 let tickCount = 0;
 let lastPools: CpmmPool[] = [];
 let lastOpportunities: ArbitrageOpportunity[] = [];
+
+/** Lazy-initialized RPC connection (only when on-chain mode is enabled). */
+let rpcConnection: Connection | null = null;
+function getRpcConnection(): Connection {
+  if (!rpcConnection) {
+    rpcConnection = new Connection(config.rpcEndpoint, "confirmed");
+  }
+  return rpcConnection;
+}
 
 // ── Main ─────────────────────────────────────────────────────────────
 
@@ -134,23 +145,74 @@ async function tick(mint1: string, mint2: string): Promise<void> {
   logger.debug({ tick: tickCount }, `── Tick #${tickCount} ──`);
 
   // Step 1: Discover all CPMM pools for this pair
-  const pools = await discoverPools(mint1, mint2);
+  const allPools = await discoverPools(mint1, mint2);
 
-  if (pools.length === 0) {
+  if (allPools.length === 0) {
     renderNoPools(mint1, mint2);
     return;
   }
 
-  lastPools = pools;
+  // Step 1.5: Optionally refresh reserves from on-chain vaults so that
+  // spot prices reflect current chain state, not the Raydium API cache.
+  if (config.useOnchainReserves) {
+    try {
+      await refreshReservesOnchain(getRpcConnection(), allPools);
+    } catch (err) {
+      logger.warn(
+        { error: (err as Error).message },
+        "On-chain reserve refresh failed; continuing with API-derived reserves"
+      );
+    }
+  }
 
-  // Step 2: Detect arbitrage opportunities
-  const opportunities = detectArbitrage(pools);
+  // Step 2: Filter out dust pools below the TVL threshold for arb math.
+  // The full pool list (including dust pools) is still rendered in the
+  // pool table for visibility.
+  const eligiblePools = allPools.filter(
+    (p) => p.tvl >= config.minPoolTvlUsd
+  );
+  if (eligiblePools.length < allPools.length) {
+    logger.debug(
+      {
+        total: allPools.length,
+        eligible: eligiblePools.length,
+        minTvl: `$${config.minPoolTvlUsd}`,
+      },
+      `Excluded ${allPools.length - eligiblePools.length} pool(s) below TVL threshold from arb detection`
+    );
+  }
+
+  lastPools = allPools;
+
+  // Step 3: Per-tick "price update" info-level log (required by spec).
+  // We summarize min/max spot prices across eligible pools so the log is
+  // useful but doesn't blow up at high tick rates.
+  if (eligiblePools.length > 0) {
+    const prices = eligiblePools.map((p) => p.spotPrice);
+    const minP = Math.min(...prices);
+    const maxP = Math.max(...prices);
+    const spread = minP > 0 ? ((maxP - minP) / minP) * 100 : 0;
+    logger.info(
+      {
+        tick: tickCount,
+        pools: eligiblePools.length,
+        minPrice: minP.toFixed(8),
+        maxPrice: maxP.toFixed(8),
+        spreadPct: spread.toFixed(4),
+        source: config.useOnchainReserves ? "onchain" : "api",
+      },
+      `Prices updated: ${eligiblePools.length} pool(s), spread ${spread.toFixed(4)}%`
+    );
+  }
+
+  // Step 4: Detect arbitrage opportunities
+  const opportunities = detectArbitrage(eligiblePools);
   lastOpportunities = opportunities;
 
-  // Step 3: Render the live-updating display
-  renderDisplay(pools, opportunities, tickStart);
+  // Step 5: Render the live-updating display
+  renderDisplay(allPools, opportunities, tickStart);
 
-  // Step 4: Log actionable opportunities in detail
+  // Step 6: Log actionable opportunities in detail
   for (const opp of opportunities.filter((o) => o.isActionable)) {
     logger.info(formatOpportunitySummary(opp));
   }
@@ -344,31 +406,37 @@ function renderArbitrageTable(opportunities: ArbitrageOpportunity[]): void {
   if (opportunities.length > 0 && opportunities[0].isActionable) {
     const best = opportunities[0];
     console.log(
-      `  ${COLORS.bold}${COLORS.green}🏆 Best Opportunity Breakdown:${COLORS.reset}`
+      `  ${COLORS.bold}${COLORS.green}Best Opportunity Breakdown:${COLORS.reset}`
     );
     console.log(
-      `  ${COLORS.dim}├─ Buy in:   ${best.buyPool.id.slice(0, 12)}... @ ${best.buyPrice.toFixed(8)} (fee: ${(best.buyPool.feeRate * 100).toFixed(2)}%)${COLORS.reset}`
+      `  ${COLORS.dim}├─ Buy in:    ${best.buyPool.id.slice(0, 12)}... spot=${best.buyPrice.toFixed(8)} effective=${best.effectiveBuyPrice.toFixed(8)} (fee: ${(best.buyPool.feeRate * 100).toFixed(2)}%)${COLORS.reset}`
     );
     console.log(
-      `  ${COLORS.dim}├─ Sell in:  ${best.sellPool.id.slice(0, 12)}... @ ${best.sellPrice.toFixed(8)} (fee: ${(best.sellPool.feeRate * 100).toFixed(2)}%)${COLORS.reset}`
+      `  ${COLORS.dim}├─ Sell in:   ${best.sellPool.id.slice(0, 12)}... spot=${best.sellPrice.toFixed(8)} effective=${best.effectiveSellPrice.toFixed(8)} (fee: ${(best.sellPool.feeRate * 100).toFixed(2)}%)${COLORS.reset}`
     );
     console.log(
-      `  ${COLORS.dim}├─ Spread:   ${best.spreadPct.toFixed(6)}%${COLORS.reset}`
+      `  ${COLORS.dim}├─ Spread:    ${best.spreadPct.toFixed(6)}% (spot)${COLORS.reset}`
     );
     console.log(
-      `  ${COLORS.dim}├─ Gross:    $${best.grossProfitUsd.toFixed(6)}${COLORS.reset}`
+      `  ${COLORS.dim}├─ Base out:  ${best.baseAmountOut.toFixed(6)} ${best.buyPool.symbolA}${COLORS.reset}`
     );
     console.log(
-      `  ${COLORS.dim}├─ Buy Fee:  $${best.buyFeeUsd.toFixed(6)}${COLORS.reset}`
+      `  ${COLORS.dim}├─ Quote out: ${best.quoteAmountOut.toFixed(6)} ${best.buyPool.symbolB}${COLORS.reset}`
     );
     console.log(
-      `  ${COLORS.dim}├─ Sell Fee: $${best.sellFeeUsd.toFixed(6)}${COLORS.reset}`
+      `  ${COLORS.dim}├─ Gross:     $${best.grossProfitUsd.toFixed(6)}${COLORS.reset}`
     );
     console.log(
-      `  ${COLORS.dim}├─ Tx Cost:  $${best.txCostUsd.toFixed(6)} (${config.solTxFeeEstimate * 2} SOL × $${config.solPriceUsd})${COLORS.reset}`
+      `  ${COLORS.dim}├─ Buy Fee:   $${best.buyFeeUsd.toFixed(6)}${COLORS.reset}`
     );
     console.log(
-      `  ${COLORS.dim}└─ Net:      ${COLORS.reset}${COLORS.green}${COLORS.bold}$${best.netProfitUsd.toFixed(6)} (${best.netProfitPct.toFixed(4)}%)${COLORS.reset}`
+      `  ${COLORS.dim}├─ Sell Fee:  $${best.sellFeeUsd.toFixed(6)}${COLORS.reset}`
+    );
+    console.log(
+      `  ${COLORS.dim}├─ Tx Cost:   $${best.txCostUsd.toFixed(6)} (${config.solTxFeeEstimate * 2} SOL × $${config.solPriceUsd})${COLORS.reset}`
+    );
+    console.log(
+      `  ${COLORS.dim}└─ Net:       ${COLORS.reset}${COLORS.green}${COLORS.bold}$${best.netProfitUsd.toFixed(6)} (${best.netProfitPct.toFixed(4)}%)${COLORS.reset}`
     );
     console.log();
   }
@@ -448,14 +516,17 @@ function printBanner(): void {
  */
 function printConfig(mint1: string, mint2: string): void {
   console.log(`  ${COLORS.bold}Configuration:${COLORS.reset}`);
-  console.log(`  ${COLORS.dim}├─ RPC:          ${config.rpcEndpoint}${COLORS.reset}`);
-  console.log(`  ${COLORS.dim}├─ Poll:         ${config.pollIntervalMs}ms${COLORS.reset}`);
-  console.log(`  ${COLORS.dim}├─ Trade Size:   $${config.tradeSizeUsd}${COLORS.reset}`);
-  console.log(`  ${COLORS.dim}├─ Min Profit:   $${config.minProfitThresholdUsd}${COLORS.reset}`);
-  console.log(`  ${COLORS.dim}├─ SOL Price:    $${config.solPriceUsd}${COLORS.reset}`);
-  console.log(`  ${COLORS.dim}├─ Tx Fee Est:   ${config.solTxFeeEstimate} SOL${COLORS.reset}`);
-  console.log(`  ${COLORS.dim}├─ Mint 1:       ${mint1}${COLORS.reset}`);
-  console.log(`  ${COLORS.dim}└─ Mint 2:       ${mint2}${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ RPC:           ${config.rpcEndpoint}${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ On-chain mode: ${config.useOnchainReserves ? "ON (refresh reserves via RPC)" : "OFF (Raydium API only)"}${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ Poll:          ${config.pollIntervalMs}ms${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ Trade Size:    $${config.tradeSizeUsd}${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ Min Profit:    $${config.minProfitThresholdUsd}${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ Min Pool TVL:  $${config.minPoolTvlUsd}${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ Include AMM v4:${config.includeAmmV4 ? " yes" : " no (CPMM only)"}${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ SOL Price:     $${config.solPriceUsd}${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ Tx Fee Est:    ${config.solTxFeeEstimate} SOL${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ Mint 1:        ${mint1}${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}└─ Mint 2:        ${mint2}${COLORS.reset}`);
   console.log();
 }
 
