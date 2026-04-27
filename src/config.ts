@@ -127,7 +127,7 @@ export const config: Readonly<AppConfig> = Object.freeze({
   solTxFeeEstimate: requirePositiveNumber("SOL_TX_FEE_ESTIMATE", "0.00035"),
   solPriceUsd: requirePositiveNumber("SOL_PRICE_USD", "150.00"),
   tradeSizeUsd: requirePositiveNumber("TRADE_SIZE_USD", "1000.00"),
-  includeAmmV4: requireBoolean("INCLUDE_AMM_V4", "false"),
+  includeAmmV4: requireBoolean("INCLUDE_AMM_V4", "true"),
   minPoolTvlUsd: requireNonNegativeNumber("MIN_POOL_TVL_USD", "1000"),
   logLevel: requireEnv("LOG_LEVEL", "info"),
 });

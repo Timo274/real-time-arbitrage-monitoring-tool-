@@ -26,6 +26,7 @@ import { logger } from "./logger";
 import { discoverPools, CpmmPool } from "./raydium";
 import { detectArbitrage, ArbitrageOpportunity, formatOpportunitySummary } from "./arbitrage";
 import { refreshReservesOnchain } from "./onchain";
+import { getSolPriceUsd, getSolPriceUsdSync, hasLiveSolPrice } from "./priceFeed";
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -96,6 +97,12 @@ async function main(): Promise<void> {
 
   // ── Print startup banner ──
   printBanner();
+
+  // Warm up the SOL/USD price cache before printing the config so
+  // the dashboard shows the live value (or "static fallback" if the
+  // network call failed).
+  await getSolPriceUsd();
+
   printConfig(mint1, mint2);
 
   logger.info(
@@ -143,6 +150,11 @@ async function tick(mint1: string, mint2: string): Promise<void> {
   const tickStart = Date.now();
 
   logger.debug({ tick: tickCount }, `── Tick #${tickCount} ──`);
+
+  // Step 0: Refresh the live SOL/USD price (cached, no-op if fresh).
+  // Fire-and-don't-block-the-tick — if the request is slow we just keep
+  // using the previous cached value.
+  void getSolPriceUsd();
 
   // Step 1: Discover all CPMM pools for this pair
   const allPools = await discoverPools(mint1, mint2);
@@ -249,7 +261,7 @@ function renderDisplay(
     `${COLORS.dim}  Tick #${tickCount} | ${now} | Latency: ${elapsed}ms | Pools: ${pools.length} | Interval: ${config.pollIntervalMs}ms${COLORS.reset}`
   );
   console.log(
-    `${COLORS.dim}  Trade Size: $${config.tradeSizeUsd} | Min Profit: $${config.minProfitThresholdUsd} | SOL Price: $${config.solPriceUsd}${COLORS.reset}`
+    `${COLORS.dim}  Trade Size: $${config.tradeSizeUsd} | Min Profit: $${config.minProfitThresholdUsd} | SOL Price: $${getSolPriceUsdSync().toFixed(4)}${hasLiveSolPrice() ? " (live)" : " (static)"}${COLORS.reset}`
   );
   console.log();
 
@@ -433,7 +445,7 @@ function renderArbitrageTable(opportunities: ArbitrageOpportunity[]): void {
       `  ${COLORS.dim}├─ Sell Fee:  $${best.sellFeeUsd.toFixed(6)}${COLORS.reset}`
     );
     console.log(
-      `  ${COLORS.dim}├─ Tx Cost:   $${best.txCostUsd.toFixed(6)} (${config.solTxFeeEstimate * 2} SOL × $${config.solPriceUsd})${COLORS.reset}`
+      `  ${COLORS.dim}├─ Tx Cost:   $${best.txCostUsd.toFixed(6)} (${config.solTxFeeEstimate * 2} SOL × $${getSolPriceUsdSync().toFixed(4)})${COLORS.reset}`
     );
     console.log(
       `  ${COLORS.dim}└─ Net:       ${COLORS.reset}${COLORS.green}${COLORS.bold}$${best.netProfitUsd.toFixed(6)} (${best.netProfitPct.toFixed(4)}%)${COLORS.reset}`
@@ -523,7 +535,7 @@ function printConfig(mint1: string, mint2: string): void {
   console.log(`  ${COLORS.dim}├─ Min Profit:    $${config.minProfitThresholdUsd}${COLORS.reset}`);
   console.log(`  ${COLORS.dim}├─ Min Pool TVL:  $${config.minPoolTvlUsd}${COLORS.reset}`);
   console.log(`  ${COLORS.dim}├─ Include AMM v4:${config.includeAmmV4 ? " yes" : " no (CPMM only)"}${COLORS.reset}`);
-  console.log(`  ${COLORS.dim}├─ SOL Price:     $${config.solPriceUsd}${COLORS.reset}`);
+  console.log(`  ${COLORS.dim}├─ SOL Price:     $${getSolPriceUsdSync().toFixed(4)} (${hasLiveSolPrice() ? "live, Raydium" : "static config fallback"})${COLORS.reset}`);
   console.log(`  ${COLORS.dim}├─ Tx Fee Est:    ${config.solTxFeeEstimate} SOL${COLORS.reset}`);
   console.log(`  ${COLORS.dim}├─ Mint 1:        ${mint1}${COLORS.reset}`);
   console.log(`  ${COLORS.dim}└─ Mint 2:        ${mint2}${COLORS.reset}`);

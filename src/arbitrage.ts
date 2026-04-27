@@ -41,6 +41,7 @@
 import { CpmmPool } from "./raydium";
 import { config } from "./config";
 import { logger } from "./logger";
+import { getSolPriceUsdSync } from "./priceFeed";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -153,8 +154,11 @@ export function detectArbitrage(pools: CpmmPool[]): ArbitrageOpportunity[] {
   const opportunities: ArbitrageOpportunity[] = [];
   const tradeSizeUsd = config.tradeSizeUsd;
 
-  // Tx cost in USD for the full arbitrage round-trip (2 transactions)
-  const txCostUsd = config.solTxFeeEstimate * 2 * config.solPriceUsd;
+  // Tx cost in USD for the full arbitrage round-trip (2 transactions).
+  // Uses the live SOL/USD price (refreshed by the price feed) and falls
+  // back to the static config value if the feed hasn't populated yet.
+  const solPriceUsd = getSolPriceUsdSync();
+  const txCostUsd = config.solTxFeeEstimate * 2 * solPriceUsd;
 
   // Compare all pool pairs
   for (let i = 0; i < pools.length; i++) {

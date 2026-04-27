@@ -30,6 +30,7 @@ Built for the **Superteam Ukraine** bounty.
 | **Live CLI Dashboard** | Color-coded terminal UI with auto-refreshing pool and opportunity tables; full breakdown for the best opportunity. |
 | **Structured Logging** | Pino-based logging with timestamps, levels, JSON output for production, per-tick price-update info logs. |
 | **Configurable** | RPC endpoint, polling interval, profit / TVL thresholds, trade size, on-chain mode — all via `.env`. |
+| **Live SOL price** | SOL/USD price fetched from Raydium's price endpoint at startup and refreshed every ~30s, so tx-fee USD conversion stays accurate. Static `.env` value is only used as a fallback. |
 | **Resilient** | Exponential back-off retry on API failures, graceful shutdown on Ctrl+C. |
 | **Tested** | Vitest unit tests for the swap formula and arbitrage detection (incl. dust-pool regression test). |
 
@@ -114,9 +115,9 @@ All configuration is managed via environment variables in `.env`:
 | `POLL_INTERVAL_MS` | `5000` | How often to poll for fresh data (milliseconds). |
 | `MIN_PROFIT_THRESHOLD_USD` | `0.50` | Minimum net profit (USD) to flag as "actionable". `0` = flag every positive opportunity. |
 | `MIN_POOL_TVL_USD` | `1000` | Pools below this TVL are still discovered/displayed but excluded from arbitrage detection (avoids dust-pool noise). `0` to include all. |
-| `INCLUDE_AMM_V4` | `false` | Also include legacy Raydium AMM v4 pools alongside CPMM (CLMM is never included — its tick math doesn't match `x·y=k`). |
+| `INCLUDE_AMM_V4` | `true` | Also include legacy Raydium AMM v4 pools alongside CPMM. CLMM is never included — its tick math doesn't match `x·y=k`. Set to `false` for CPMM-only mode. |
 | `SOL_TX_FEE_ESTIMATE` | `0.00035` | Estimated SOL cost per transaction (base + priority fees). |
-| `SOL_PRICE_USD` | `150.00` | Current SOL/USD price for fee conversion. |
+| `SOL_PRICE_USD` | `150.00` | Static fallback SOL/USD price. The live price is fetched from Raydium's price endpoint at startup and refreshed every ~30s; this value is only used if the network call fails. |
 | `TRADE_SIZE_USD` | `1000.00` | Notional trade amount for profit estimation. |
 | `LOG_LEVEL` | `info` | Pino log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal`. |
 
@@ -234,6 +235,7 @@ real-time-arbitrage-monitoring-tool-/
     ├── logger.ts         # Structured Pino logger setup
     ├── raydium.ts        # Raydium V3 API client & pool parsing
     ├── onchain.ts        # On-chain reserve refresh via JSON-RPC
+    ├── priceFeed.ts      # Live SOL/USD price feed (Raydium /mint/price)
     ├── arbitrage.ts      # CPMM swap simulation & arbitrage detection
     ├── arbitrage.test.ts # Unit tests for arbitrage math
     ├── raydium.test.ts   # Unit tests for spot-price helpers
@@ -248,6 +250,7 @@ real-time-arbitrage-monitoring-tool-/
 | `logger.ts` | Creates a Pino logger with pino-pretty (dev) or JSON (prod) output. |
 | `raydium.ts` | Fetches pools from Raydium V3 API, parses responses, computes reserve-based spot prices, filters by program ID (CPMM, optionally AMM v4). |
 | `onchain.ts` | Resolves vault pubkeys for discovered pools, fetches them with `getMultipleAccountsInfo`, decodes SPL Token amount, mutates pools in-place with fresh reserves. |
+| `priceFeed.ts` | Fetches SOL/USD from Raydium's `/mint/price` endpoint and caches it (auto-refreshes every 30 s). Falls back to the static `SOL_PRICE_USD` if the endpoint is unreachable. |
 | `arbitrage.ts` | Simulates round-trip swaps with the proper CPMM formula, ranks opportunities by net profit. |
 | `index.ts` | Parses CLI args, runs the polling loop, renders the terminal dashboard. |
 
