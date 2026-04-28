@@ -88,7 +88,18 @@ export interface ArbitrageOpportunity {
   /** Solana transaction cost component (USD) */
   txCostUsd: number;
 
-  /** Total fees deducted: buy fee + sell fee + tx costs (USD) */
+  /**
+   * Total deduction from gross to net profit (USD).
+   *
+   * Pool fees are already embedded inside `grossProfitUsd` via the CPMM
+   * swap math (see `getCpmmAmountOut`), so the only additional cost on top
+   * of the gross is the round-trip Solana transaction cost. This value is
+   * therefore equal to `txCostUsd`, ensuring `grossProfitUsd - totalFeesUsd
+   * === netProfitUsd` in the dashboard table.
+   *
+   * `buyFeeUsd` / `sellFeeUsd` are still reported separately for
+   * transparency about how much of the slippage came from protocol fees.
+   */
   totalFeesUsd: number;
 
   /** Net profit after pool fees, slippage AND tx costs (USD) */
@@ -271,14 +282,21 @@ function calculateOpportunity(
   // ── Profit components ──
   const grossProfitUsd = quoteAmountOut - tradeSizeUsd;
 
-  // Fee breakdown (informational): the protocol fee deducted on each leg.
+  // Fee breakdown (informational only): the protocol fee deducted on each
+  // leg. These are *already* baked into `grossProfitUsd` via the CPMM swap
+  // math, so they MUST NOT be subtracted again when computing net profit.
+  // We surface them separately just to show the user how much of the
+  // slippage came from protocol fees vs. price impact.
   // Buy leg fee in USD = quote-in * feeRate (charged on quote input).
   const buyFeeUsd = tradeSizeUsd * buyPool.feeRate;
   // Sell leg fee in USD = effective USD value of the base-input fee.
   const sellFeeUsd = baseAmountOut * effectiveSellPrice * sellPool.feeRate;
 
-  const totalFeesUsd = buyFeeUsd + sellFeeUsd + txCostUsd;
-  const netProfitUsd = grossProfitUsd - txCostUsd;
+  // Pool fees are embedded in grossProfitUsd; the only deduction left is
+  // the round-trip tx cost. Keeping totalFeesUsd === txCostUsd preserves
+  // the `Gross − Fees = Net` invariant shown in the dashboard.
+  const totalFeesUsd = txCostUsd;
+  const netProfitUsd = grossProfitUsd - totalFeesUsd;
   const netProfitPct = (netProfitUsd / tradeSizeUsd) * 100;
 
   const isActionable = netProfitUsd >= config.minProfitThresholdUsd;

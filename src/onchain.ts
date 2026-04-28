@@ -170,9 +170,12 @@ export async function refreshReservesOnchain(
     return pools;
   }
 
-  // 4) Apply fresh amounts
-  const poolById = new Map(pools.map((p) => [p.id, p]));
-  let refreshed = 0;
+  // 4) Decode amounts into a per-pool staging map, but DO NOT mutate
+  //    pool reserves yet. We only commit a pool's update if BOTH sides
+  //    (A and B) decoded successfully — otherwise we'd end up with
+  //    mismatched fresh/stale reserves and a wrong spot price, which
+  //    could produce false arbitrage signals downstream.
+  const staged = new Map<string, { a?: number; b?: number }>();
 
   for (let i = 0; i < infos.length; i++) {
     const info = infos[i];
@@ -191,25 +194,51 @@ export async function refreshReservesOnchain(
       continue;
     }
 
-    const pool = poolById.get(meta.poolId);
-    if (!pool) continue;
-
-    const decimals = meta.side === "A" ? pool.decimalsA : pool.decimalsB;
-    const human = amount / Math.pow(10, decimals);
-
-    if (meta.side === "A") {
-      pool.reserveA = human;
-    } else {
-      pool.reserveB = human;
-    }
+    const slot = staged.get(meta.poolId) ?? {};
+    if (meta.side === "A") slot.a = amount;
+    else slot.b = amount;
+    staged.set(meta.poolId, slot);
   }
 
-  // 5) Recompute spot price for pools we touched
-  for (const pool of pools) {
-    if (vaults.has(pool.id) && pool.reserveA > 0) {
-      pool.spotPrice = pool.reserveB / pool.reserveA;
-      refreshed++;
+  // 5) Atomically commit reserves + recompute spot price ONLY for pools
+  //    where both vault sides were decoded successfully. Pools with a
+  //    partial decode keep their original API-derived reserves entirely.
+  const poolById = new Map(pools.map((p) => [p.id, p]));
+  let refreshed = 0;
+  let partial = 0;
+
+  for (const [poolId, amounts] of staged) {
+    const pool = poolById.get(poolId);
+    if (!pool) continue;
+
+    if (amounts.a === undefined || amounts.b === undefined) {
+      partial++;
+      logger.debug(
+        { poolId, hasA: amounts.a !== undefined, hasB: amounts.b !== undefined },
+        "Skipping pool with partial vault decode; keeping API-derived reserves"
+      );
+      continue;
     }
+
+    const reserveA = amounts.a / Math.pow(10, pool.decimalsA);
+    const reserveB = amounts.b / Math.pow(10, pool.decimalsB);
+
+    if (reserveA <= 0) {
+      logger.debug({ poolId }, "On-chain reserveA is zero; keeping API reserves");
+      continue;
+    }
+
+    pool.reserveA = reserveA;
+    pool.reserveB = reserveB;
+    pool.spotPrice = reserveB / reserveA;
+    refreshed++;
+  }
+
+  if (partial > 0) {
+    logger.warn(
+      { partial, total: pools.length },
+      `${partial} pool(s) had partial on-chain vault decodes and were left at API reserves`
+    );
   }
 
   logger.info(

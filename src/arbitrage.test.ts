@@ -167,4 +167,31 @@ describe("detectArbitrage", () => {
     const p2 = makePool({ id: "p2", spotPrice: 100, reserveA: 100_000, reserveB: 10_000_000 });
     expect(detectArbitrage([p1, p2])).toEqual([]);
   });
+
+  it("preserves the dashboard invariant Gross − totalFeesUsd = Net", () => {
+    // Pool fees are embedded in grossProfitUsd via the CPMM swap math, so
+    // totalFeesUsd must equal txCostUsd (not txCost + buyFee + sellFee),
+    // otherwise the dashboard's Gross/Fees/Net columns won't add up.
+    const cheap = makePool({
+      id: "cheap",
+      reserveA: 100_000,
+      reserveB: 9_950_000,
+      spotPrice: 99.5,
+      feeRate: 0.0025,
+      tvl: 10_000_000,
+    });
+    const expensive = makePool({
+      id: "expensive",
+      reserveA: 100_000,
+      reserveB: 10_050_000,
+      spotPrice: 100.5,
+      feeRate: 0.0025,
+      tvl: 10_000_000,
+    });
+
+    const [opp] = detectArbitrage([cheap, expensive]);
+    expect(opp).toBeDefined();
+    expect(opp.totalFeesUsd).toBeCloseTo(opp.txCostUsd, 8);
+    expect(opp.grossProfitUsd - opp.totalFeesUsd).toBeCloseTo(opp.netProfitUsd, 8);
+  });
 });
